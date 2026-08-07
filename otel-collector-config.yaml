@@ -1,0 +1,50 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 180
+    spike_limit_mib: 40
+
+  batch:
+    timeout: 1s
+    send_batch_size: 512
+
+exporters:
+  debug:
+    verbosity: detailed
+
+  elasticsearch:
+    endpoints:
+      - https://es01:9200
+
+    user: ${env:ELASTIC_USER}
+    password: ${env:ELASTIC_PASSWORD}
+
+    tls:
+      ca_file: /etc/otelcol/certs/ca/ca.crt
+
+service:
+  telemetry:
+    logs:
+      level: info
+
+  pipelines:
+    traces:
+      receivers:
+        - otlp
+
+      processors:
+        - memory_limiter
+        - batch
+
+      exporters:
+        - debug
+        - elasticsearch

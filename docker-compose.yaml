@@ -1,72 +1,292 @@
-version: "3"
+services:
+  setup:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: setup
+    user: "0"
+    volumes:
+      - certs:/usr/share/elasticsearch/config/certs
 
-services:  
+    command: >
+      bash -c '
+        set -euo pipefail
 
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:7.13.0
-    container_name: elasticsearch
+        if [ -z "${ELASTIC_PASSWORD:-}" ]; then
+          echo "ELASTIC_PASSWORD must be set"
+          exit 1
+        fi
+
+        if [ -z "${KIBANA_PASSWORD:-}" ]; then
+          echo "KIBANA_PASSWORD must be set"
+          exit 1
+        fi
+
+        mkdir -p config/certs
+
+        if [ ! -f config/certs/ca/ca.crt ]; then
+          echo "Creating CA"
+
+          rm -f config/certs/ca.zip
+
+          bin/elasticsearch-certutil ca \
+            --silent \
+            --pem \
+            --out config/certs/ca.zip
+
+          unzip -o config/certs/ca.zip -d config/certs
+        fi
+
+        if [ ! -f config/certs/es01/es01.crt ]; then
+          echo "Creating Elasticsearch certificate"
+
+          rm -f config/certs/certs.zip
+
+          cat > config/certs/instances.yml <<EOF
+      instances:
+        - name: es01
+          dns:
+            - es01
+            - localhost
+          ip:
+            - 127.0.0.1
+      EOF
+
+          bin/elasticsearch-certutil cert \
+            --silent \
+            --pem \
+            --out config/certs/certs.zip \
+            --in config/certs/instances.yml \
+            --ca-cert config/certs/ca/ca.crt \
+            --ca-key config/certs/ca/ca.key
+
+          unzip -o config/certs/certs.zip -d config/certs
+        fi
+
+        echo "Setting certificate permissions"
+
+        chown -R root:root config/certs
+        find config/certs -type d -exec chmod 755 {} \;
+        find config/certs -type f -exec chmod 644 {} \;
+
+        echo "Waiting for Elasticsearch"
+
+        until curl \
+          --silent \
+          --cacert config/certs/ca/ca.crt \
+          https://es01:9200 |
+          grep -q "missing authentication credentials"
+        do
+          sleep 5
+        done
+
+        echo "Configuring kibana_system password"
+
+        until curl \
+          --silent \
+          --request POST \
+          --cacert config/certs/ca/ca.crt \
+          --user "elastic:${ELASTIC_PASSWORD}" \
+          --header "Content-Type: application/json" \
+          https://es01:9200/_security/user/kibana_system/_password \
+          --data "{\"password\":\"${KIBANA_PASSWORD}\"}" |
+          grep -q "^{}"
+        do
+          sleep 5
+        done
+
+        echo "Setup completed"
+      '
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "test -f config/certs/es01/es01.crt"
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  es01:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${STACK_VERSION}
+    container_name: es01
+    depends_on:
+      setup:
+        condition: service_healthy
+
     environment:
-      - node.name=elasticsearch
-      - cluster.name=es-docker-cluster
-      - bootstrap.memory_lock=true
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-      - http.cors.enabled=true
-      - http.cors.allow-origin="*"
-      - discovery.type=single-node
+      node.name: es01
+      cluster.name: ${CLUSTER_NAME}
+      discovery.type: single-node
+
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+
+      bootstrap.memory_lock: "true"
+
+      xpack.security.enabled: "true"
+
+      xpack.security.http.ssl.enabled: "true"
+      xpack.security.http.ssl.key: certs/es01/es01.key
+      xpack.security.http.ssl.certificate: certs/es01/es01.crt
+      xpack.security.http.ssl.certificate_authorities: certs/ca/ca.crt
+
+      xpack.security.transport.ssl.enabled: "true"
+      xpack.security.transport.ssl.key: certs/es01/es01.key
+      xpack.security.transport.ssl.certificate: certs/es01/es01.crt
+      xpack.security.transport.ssl.certificate_authorities: certs/ca/ca.crt
+      xpack.security.transport.ssl.verification_mode: certificate
+
+      xpack.license.self_generated.type: ${LICENSE}
+
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+
+    mem_limit: ${ES_MEM_LIMIT}
+
     ulimits:
       memlock:
         soft: -1
         hard: -1
+
     volumes:
-      - ./elasticsearch_data:/usr/share/elasticsearch/data
+      - certs:/usr/share/elasticsearch/config/certs
+      - esdata01:/usr/share/elasticsearch/data
+
     ports:
-      - 9200:9200
-    networks: 
-        - observability
-   
+      - "${ES_PORT}:9200"
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl --silent --cacert config/certs/ca/ca.crt https://localhost:9200 | grep -q 'missing authentication credentials'"
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 60
+
   kibana:
-    image: docker.elastic.co/kibana/kibana:7.13.0
+    image: docker.elastic.co/kibana/kibana:${STACK_VERSION}
     container_name: kibana
-    ports:
-      - 5601:5601
+    depends_on:
+      es01:
+        condition: service_healthy
+
     environment:
-      ELASTICSEARCH_URL: http://elasticsearch:9200
-      ELASTICSEARCH_HOSTS: '["http://elasticsearch:9200"]'
-    networks: 
-        - observability
+      SERVERNAME: kibana
+      SERVER_HOST: 0.0.0.0
 
-  metricbeat:
-    image: docker.elastic.co/beats/metricbeat:7.13.0
-    container_name: metricbeat
-    user: root
-    volumes:      
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ./beats/metric/metricbeat.yml:/usr/share/metricbeat/metricbeat.yml
-    restart: on-failure
-    networks: 
-      - observability
+      ELASTICSEARCH_HOSTS: '["https://es01:9200"]'
+      ELASTICSEARCH_USERNAME: kibana_system
+      ELASTICSEARCH_PASSWORD: ${KIBANA_PASSWORD}
+      ELASTICSEARCH_SSL_CERTIFICATEAUTHORITIES: config/certs/ca/ca.crt
 
-  heartbeat:
-    image: docker.elastic.co/beats/heartbeat:7.13.0
-    container_name: heartbeat
-    volumes:      
-    - ./beats/heartbeat/heartbeat.yml:/usr/share/heartbeat/heartbeat.yml
-    environment: 
-    - setup.kibana.host=kibana:5601
-    networks: 
-      - observability
+      XPACK_SECURITY_ENCRYPTIONKEY: ${SECURITY_ENCRYPTION_KEY}
+      XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY: ${SAVED_OBJECTS_ENCRYPTION_KEY}
+      XPACK_REPORTING_ENCRYPTIONKEY: ${REPORTING_ENCRYPTION_KEY}
 
-  apm:
-    image: docker.elastic.co/apm/apm-server-oss:7.13.0
-    container_name: apm
-    volumes:      
-    - ./apm/apm-server.yml:/usr/share/apm-server/apm-server.yml
+      TELEMETRY_ENABLED: "false"
+
+      NODE_OPTIONS: "--max-old-space-size=768"
+
+    mem_limit: ${KB_MEM_LIMIT}
+
+    volumes:
+      - certs:/usr/share/kibana/config/certs
+      - kibanadata:/usr/share/kibana/data
+
     ports:
-      - "8200:8200"
-    restart: on-failure
-    networks: 
-      - observability
+      - "${KIBANA_PORT}:5601"
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl --silent --head http://localhost:5601 | grep -q 'HTTP/1.1 302 Found'"
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 90
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.138.0
+    container_name: otel-collector
+
+    command:
+      - --config=/etc/otelcol/config.yaml
+
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol/config.yaml:ro
+      - certs:/etc/otelcol/certs:ro
+
+    environment:
+      ELASTIC_USER: elastic
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD}
+
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+      - "13133:13133"
+
+    depends_on:
+      es01:
+        condition: service_healthy
+
+    mem_limit: 256m
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    mem_limit: 64m
+
+  favorite-go:
+    build:
+      context: ./favorite-go
+    container_name: favorite-go
+
+    depends_on:
+      redis:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+
+    environment:
+      REDIS_HOST: redis:6379
+
+    volumes:
+      - favorite-go-bin:/shared
+
+    ports:
+      - "5001:5000"
+
+    mem_limit: 128m
+
+  go-auto:
+    image: otel/autoinstrumentation-go:latest
+    container_name: go-auto
+    privileged: true
+    pid: "host"
+    depends_on:
+      - favorite-go
+      - otel-collector
+    environment:
+      OTEL_GO_AUTO_TARGET_EXE: /shared/favorite-go
+      OTEL_SERVICE_NAME: favorite-go
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_PROPAGATORS: tracecontext,baggage
+      OTEL_RESOURCE_ATTRIBUTES: >-
+        deployment.environment.name=local,
+        service.version=0.1.0
+    volumes:
+      - favorite-go-bin:/shared:ro
+      - /proc:/host/proc
+    mem_limit: 128m
+
+volumes:
+  certs:
+  esdata01:
+  kibanadata:
+  favorite-go-bin:
 
 networks:
-  observability:
-    external: true
+  default:
+    name: aibis-elastic
